@@ -304,10 +304,21 @@ def connection_check_wc(wc_base: str, ck: str, cs: str, timeout_s: float, verify
     return {"base": m1, "auth_probe": m2}
 
 
-def wc_get_customer_id_by_email(wc_base: str, ck: str, cs: str, email: str, timeout_s: float, verify_tls: bool) -> Tuple[Optional[int], Dict[str, Any], Any]:
+from urllib.parse import quote_plus
+from typing import Any, Dict, List, Optional, Tuple
+
+def wc_get_customer_id_by_email(
+    wc_base: str,
+    ck: str,
+    cs: str,
+    email: str,
+    timeout_s: float,
+    verify_tls: bool,
+) -> Tuple[Optional[int], Dict[str, Any], Any]:
     auth = (ck, cs)
-    url = wc_make_url(wc_base, "/wp-json/wc/v3/customers", f"email={quote_plus(email.strip())}&per_page=10")
-    data, metrics = timed_get_json(url, {"Accept": "application/json"}, timeout_s, verify_tls, auth=auth)
+    url = f"{wc_base.rstrip('/')}/wp-json/wc/v3/customers?email={quote_plus(email.strip())}&per_page=10"
+    data, metrics = timed_get_json(url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+
     customer_id = None
     if isinstance(data, list) and data and isinstance(data[0], dict):
         cid = data[0].get("id")
@@ -316,6 +327,111 @@ def wc_get_customer_id_by_email(wc_base: str, ck: str, cs: str, email: str, time
     return customer_id, metrics, data
 
 
+def wc_fetch_orders_by_email_fallback(
+    wc_base: str,
+    ck: str,
+    cs: str,
+    email: str,
+    timeout_s: float,
+    verify_tls: bool,
+    per_page: int = 100,
+) -> Tuple[Any, Dict[str, Any]]:
+    auth = (ck, cs)
+    url = f"{wc_base.rstrip('/')}/wp-json/wc/v3/orders?search={quote_plus(email.strip())}&per_page={per_page}&orderby=date&order=desc"
+    data, metrics = timed_get_json(url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+
+    if not isinstance(data, list):
+        return data, metrics
+
+    email_l = email.strip().lower()
+    filtered = []
+    for o in data:
+        if not isinstance(o, dict):
+            continue
+        b = o.get("billing") or {}
+        b_email = (b.get("email") or "").strip().lower()
+        if b_email == email_l:
+            filtered.append(o)
+
+    return filtered, metrics
+
+
+def wc_fetch_subscriptions_by_email_fallback(
+    wc_base: str,
+    ck: str,
+    cs: str,
+    email: str,
+    timeout_s: float,
+    verify_tls: bool,
+    per_page: int = 100,
+) -> Tuple[Any, Dict[str, Any]]:
+    auth = (ck, cs)
+    url = f"{wc_base.rstrip('/')}/wp-json/wc/v1/subscriptions?search={quote_plus(email.strip())}&per_page={per_page}&orderby=date&order=desc"
+    data, metrics = timed_get_json(url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+
+    if not isinstance(data, list):
+        return data, metrics
+
+    email_l = email.strip().lower()
+    filtered = []
+    for s in data:
+        if not isinstance(s, dict):
+            continue
+        b = s.get("billing") or {}
+        b_email = (b.get("email") or "").strip().lower()
+        if b_email == email_l:
+            filtered.append(s)
+
+    return filtered, metrics
+
+
+def wc_fetch_orders_and_subs_for_email(
+    wc_base: str,
+    ck: str,
+    cs: str,
+    email: str,
+    timeout_s: float,
+    verify_tls: bool,
+    extra_query: str,
+) -> Dict[str, Any]:
+    auth = (ck, cs)
+
+    customer_id, cust_metrics, cust_payload = wc_get_customer_id_by_email(
+        wc_base, ck, cs, email, timeout_s, verify_tls
+    )
+
+    if customer_id:
+        orders_url = f"{wc_base.rstrip('/')}/wp-json/wc/v3/orders?customer={customer_id}"
+        if extra_query.strip():
+            orders_url += f"&{extra_query.strip()}"
+        orders_json, orders_metrics = timed_get_json(orders_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+
+        subs_url = f"{wc_base.rstrip('/')}/wp-json/wc/v1/subscriptions?customer={customer_id}"
+        if extra_query.strip():
+            subs_url += f"&{extra_query.strip()}"
+        subs_json, subs_metrics = timed_get_json(subs_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+
+        return {
+            "customer_lookup": {"data": cust_payload, "metrics": cust_metrics, "customer_id": customer_id},
+            "orders": {"data": orders_json, "metrics": orders_metrics},
+            "subscriptions": {"data": subs_json, "metrics": subs_metrics},
+            "used_fallback": False,
+        }
+
+    orders_json, orders_metrics = wc_fetch_orders_by_email_fallback(
+        wc_base, ck, cs, email, timeout_s, verify_tls
+    )
+    subs_json, subs_metrics = wc_fetch_subscriptions_by_email_fallback(
+        wc_base, ck, cs, email, timeout_s, verify_tls
+    )
+
+    return {
+        "customer_lookup": {"data": cust_payload, "metrics": cust_metrics, "customer_id": None},
+        "orders": {"data": orders_json, "metrics": orders_metrics},
+        "subscriptions": {"data": subs_json, "metrics": subs_metrics},
+        "used_fallback": True,
+    }
+    
 def run_proxy(email: str, proxy_base: str, proxy_api_key: str, timeout_s: float, verify_tls: bool, extra_query: str, manual_sid: str, mode: str) -> Dict[str, Any]:
     headers = build_proxy_headers(proxy_api_key)
 
