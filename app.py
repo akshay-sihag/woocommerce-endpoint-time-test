@@ -90,10 +90,6 @@ def timed_get_json(
 
 
 def collect_subscription_ids(payload: Any) -> List[int]:
-    """
-    Works even if payload is wrapped or nested
-    Looks for id and subscription_id keys anywhere
-    """
     found: List[int] = []
 
     def visit(node: Any):
@@ -229,21 +225,14 @@ def filter_subscriptions_payload(payload: Any) -> Any:
     return payload
 
 
-def render_scrollable_json(title: str, data: Any, height: int = 320):
-    st.write(title)
+def render_json_textarea(key: str, data: Any, height: int = 320):
     if data is None:
-        st.write("No JSON returned")
+        st.text_area("JSON", value="No JSON returned", height=120, key=key)
         return
-    with st.container(height=height):
-        st.code(pretty_json(data), language="json")
+    st.text_area("JSON", value=pretty_json(data), height=height, key=key)
 
 
-def render_call_block(
-    title: str,
-    data: Any,
-    metrics: Dict[str, Any],
-    extra_time_ms: Optional[float] = None,
-):
+def render_call_block(title: str, data: Any, metrics: Dict[str, Any], extra_time_ms: Optional[float] = None, json_key: str = "json"):
     st.subheader(title)
     st.write(f"URL: {metrics.get('url')}")
     st.write(f"Status: {metrics.get('status_code')}  |  OK: {metrics.get('ok')}")
@@ -254,10 +243,9 @@ def render_call_block(
     st.write(f"Response size: {metrics.get('bytes', 0)} bytes")
 
     if metrics.get("error"):
-        with st.container(height=140):
-            st.code(metrics["error"], language="text")
+        st.text_area("Error", value=str(metrics["error"]), height=140, key=f"{json_key}_err")
 
-    render_scrollable_json("JSON", data, height=340)
+    render_json_textarea(key=json_key, data=data, height=340)
 
     if data is not None:
         st.download_button(
@@ -265,6 +253,7 @@ def render_call_block(
             data=pretty_json(data).encode("utf-8"),
             file_name=f"{title.lower().replace(' ', '_')}.json",
             mime="application/json",
+            key=f"{json_key}_dl",
         )
 
 
@@ -289,93 +278,45 @@ def proxy_make_url(base: str, path: str, email: str, extra_query: str) -> str:
     email_q = quote_plus(email.strip())
     extra = extra_query.strip()
     if extra:
-        if extra.startswith("&"):
-            return f"{base}{path}?email={email_q}{extra}"
-        if extra.startswith("?"):
-            return f"{base}{path}?email={email_q}&{extra[1:]}"
         return f"{base}{path}?email={email_q}&{extra}"
     return f"{base}{path}?email={email_q}"
 
 
-def wc_url(base: str, path: str, extra_query: str) -> str:
-    extra = extra_query.strip()
-    if extra:
-        if extra.startswith("&"):
-            return f"{base}{path}?{extra[1:]}"
-        if extra.startswith("?"):
-            return f"{base}{path}{extra}"
-        return f"{base}{path}?{extra}"
+def wc_make_url(base: str, path: str, query: str) -> str:
+    q = query.strip()
+    if q:
+        return f"{base}{path}?{q}"
     return f"{base}{path}"
 
 
-def wc_get_customer_id_by_email(
-    wc_base: str,
-    ck: str,
-    cs: str,
-    email: str,
-    timeout_s: float,
-    verify_tls: bool,
-    per_page: int = 10,
-) -> Tuple[Optional[int], Dict[str, Any], Optional[Any]]:
+def connection_check_proxy(proxy_base: str, proxy_api_key: str, timeout_s: float, verify_tls: bool) -> Dict[str, Any]:
+    headers = build_proxy_headers(proxy_api_key)
+    _, m1 = timed_get(f"{proxy_base}/", {}, timeout_s, verify_tls)
+    _, m2 = timed_get(f"{proxy_base}/api/woocommerce/orders", headers, timeout_s, verify_tls)
+    return {"base": m1, "auth_probe": m2}
+
+
+def connection_check_wc(wc_base: str, ck: str, cs: str, timeout_s: float, verify_tls: bool) -> Dict[str, Any]:
     auth = (ck, cs)
-    url = wc_url(
-        wc_base,
-        "/wp-json/wc/v3/customers",
-        f"email={quote_plus(email.strip())}&per_page={per_page}",
-    )
-    data, metrics = timed_get_json(url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+    _, m1 = timed_get(f"{wc_base}/", {}, timeout_s, verify_tls)
+    probe = wc_make_url(wc_base, "/wp-json/wc/v3/system_status", "")
+    _, m2 = timed_get(probe, {"Accept": "application/json"}, timeout_s, verify_tls, auth=auth)
+    return {"base": m1, "auth_probe": m2}
+
+
+def wc_get_customer_id_by_email(wc_base: str, ck: str, cs: str, email: str, timeout_s: float, verify_tls: bool) -> Tuple[Optional[int], Dict[str, Any], Any]:
+    auth = (ck, cs)
+    url = wc_make_url(wc_base, "/wp-json/wc/v3/customers", f"email={quote_plus(email.strip())}&per_page=10")
+    data, metrics = timed_get_json(url, {"Accept": "application/json"}, timeout_s, verify_tls, auth=auth)
     customer_id = None
-    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+    if isinstance(data, list) and data and isinstance(data[0], dict):
         cid = data[0].get("id")
         if isinstance(cid, int):
             customer_id = cid
     return customer_id, metrics, data
 
 
-def connection_check_proxy(
-    proxy_base: str,
-    proxy_api_key: str,
-    timeout_s: float,
-    verify_tls: bool,
-) -> Dict[str, Any]:
-    headers = build_proxy_headers(proxy_api_key)
-
-    base_url = f"{proxy_base}/"
-    _, m1 = timed_get(base_url, headers={}, timeout_s=timeout_s, verify_tls=verify_tls)
-
-    probe_url = f"{proxy_base}/api/woocommerce/orders"
-    _, m2 = timed_get(probe_url, headers=headers, timeout_s=timeout_s, verify_tls=verify_tls)
-
-    return {"base": m1, "auth_probe": m2}
-
-
-def connection_check_wc(
-    wc_base: str,
-    ck: str,
-    cs: str,
-    timeout_s: float,
-    verify_tls: bool,
-) -> Dict[str, Any]:
-    auth = (ck, cs)
-
-    base_url = f"{wc_base}/"
-    _, m1 = timed_get(base_url, headers={}, timeout_s=timeout_s, verify_tls=verify_tls)
-
-    probe_url = wc_url(wc_base, "/wp-json/wc/v3/system_status", "")
-    _, m2 = timed_get(probe_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
-
-    return {"base": m1, "auth_probe": m2}
-
-
-def run_proxy_full(
-    proxy_base: str,
-    proxy_api_key: str,
-    email: str,
-    timeout_s: float,
-    verify_tls: bool,
-    extra_query: str,
-    manual_sid: str,
-) -> Dict[str, Any]:
+def run_proxy(email: str, proxy_base: str, proxy_api_key: str, timeout_s: float, verify_tls: bool, extra_query: str, manual_sid: str, mode: str) -> Dict[str, Any]:
     headers = build_proxy_headers(proxy_api_key)
 
     orders_url = proxy_make_url(proxy_base, "/api/woocommerce/orders", email, extra_query)
@@ -389,191 +330,126 @@ def run_proxy_full(
     else:
         sub_ids = collect_subscription_ids(subs_json)
 
-    sub_orders: List[Dict[str, Any]] = []
-    for sid in sub_ids:
-        so_url = proxy_make_url(proxy_base, f"/api/woocommerce/subscriptions/{sid}/orders", email, extra_query)
-        so_json, so_metrics = timed_get_json(so_url, headers, timeout_s, verify_tls)
-        sub_orders.append({"subscription_id": sid, "data": so_json, "metrics": so_metrics})
-
-    return {
-        "orders": {"data": orders_json, "metrics": orders_metrics},
-        "subscriptions": {"data": subs_json, "metrics": subs_metrics},
-        "subscription_ids": sub_ids,
-        "subscription_orders": sub_orders,
-    }
-
-
-def run_proxy_required(
-    proxy_base: str,
-    proxy_api_key: str,
-    email: str,
-    timeout_s: float,
-    verify_tls: bool,
-    extra_query: str,
-    manual_sid: str,
-) -> Dict[str, Any]:
-    headers = build_proxy_headers(proxy_api_key)
-
-    subs_url = proxy_make_url(proxy_base, "/api/woocommerce/subscriptions", email, extra_query)
-    subs_json, subs_metrics = timed_get_json(subs_url, headers, timeout_s, verify_tls)
-    t0 = time.perf_counter_ns()
-    subs_filtered = filter_subscriptions_payload(subs_json)
-    t1 = time.perf_counter_ns()
-    subs_filter_ms = (t1 - t0) / 1_000_000.0
-
-    orders_url = proxy_make_url(proxy_base, "/api/woocommerce/orders", email, extra_query)
-    orders_json, orders_metrics = timed_get_json(orders_url, headers, timeout_s, verify_tls)
-    t0 = time.perf_counter_ns()
-    orders_filtered = filter_orders_payload(orders_json)
-    t1 = time.perf_counter_ns()
-    orders_filter_ms = (t1 - t0) / 1_000_000.0
-
-    if manual_sid.strip().isdigit():
-        sub_ids = [int(manual_sid.strip())]
-    else:
-        sub_ids = collect_subscription_ids(subs_json)
-
-    sub_orders: List[Dict[str, Any]] = []
-    for sid in sub_ids:
-        so_url = proxy_make_url(proxy_base, f"/api/woocommerce/subscriptions/{sid}/orders", email, extra_query)
-        so_json, so_metrics = timed_get_json(so_url, headers, timeout_s, verify_tls)
+    if mode == "required":
         t0 = time.perf_counter_ns()
-        so_filtered = filter_orders_payload(so_json)
+        subs_out = filter_subscriptions_payload(subs_json)
         t1 = time.perf_counter_ns()
-        so_filter_ms = (t1 - t0) / 1_000_000.0
+        subs_filter_ms = (t1 - t0) / 1_000_000.0
+
+        t0 = time.perf_counter_ns()
+        orders_out = filter_orders_payload(orders_json)
+        t1 = time.perf_counter_ns()
+        orders_filter_ms = (t1 - t0) / 1_000_000.0
+    else:
+        subs_out = subs_json
+        orders_out = orders_json
+        subs_filter_ms = None
+        orders_filter_ms = None
+
+    sub_orders = []
+    for sid in sub_ids:
+        so_url = proxy_make_url(proxy_base, f"/api/woocommerce/subscriptions/{sid}/orders", email, extra_query)
+        so_json, so_metrics = timed_get_json(so_url, headers, timeout_s, verify_tls)
+
+        if mode == "required":
+            t0 = time.perf_counter_ns()
+            so_out = filter_orders_payload(so_json)
+            t1 = time.perf_counter_ns()
+            so_filter_ms = (t1 - t0) / 1_000_000.0
+        else:
+            so_out = so_json
+            so_filter_ms = None
+
         sub_orders.append(
             {
                 "subscription_id": sid,
-                "data": so_filtered,
+                "data": so_out,
                 "metrics": so_metrics,
-                "filter_elapsed_ms": so_filter_ms,
+                "filter_ms": so_filter_ms,
             }
         )
 
     return {
-        "subscriptions": {"data": subs_filtered, "metrics": subs_metrics, "filter_ms": subs_filter_ms},
-        "orders": {"data": orders_filtered, "metrics": orders_metrics, "filter_ms": orders_filter_ms},
+        "orders": {"data": orders_out, "metrics": orders_metrics, "filter_ms": orders_filter_ms},
+        "subscriptions": {"data": subs_out, "metrics": subs_metrics, "filter_ms": subs_filter_ms},
         "subscription_ids": sub_ids,
         "subscription_orders": sub_orders,
     }
 
 
-def run_wc_full(
-    wc_base: str,
-    ck: str,
-    cs: str,
-    email: str,
-    timeout_s: float,
-    verify_tls: bool,
-    extra_query: str,
-    manual_sid: str,
-) -> Dict[str, Any]:
+def run_wc(email: str, wc_base: str, ck: str, cs: str, timeout_s: float, verify_tls: bool, extra_query: str, manual_sid: str, mode: str) -> Dict[str, Any]:
     auth = (ck, cs)
 
-    customer_id, customer_metrics, customers_payload = wc_get_customer_id_by_email(
-        wc_base, ck, cs, email, timeout_s, verify_tls
-    )
-
+    customer_id, cust_metrics, cust_payload = wc_get_customer_id_by_email(wc_base, ck, cs, email, timeout_s, verify_tls)
     if not customer_id:
         return {
-            "customer_lookup": {"data": customers_payload, "metrics": customer_metrics},
-            "orders": {"data": None, "metrics": {"ok": False, "status_code": None, "elapsed_ms": 0.0, "bytes": 0, "url": "", "error": "No customer id found for this email"}},
-            "subscriptions": {"data": None, "metrics": {"ok": False, "status_code": None, "elapsed_ms": 0.0, "bytes": 0, "url": "", "error": "No customer id found for this email"}},
+            "customer_lookup": {"data": cust_payload, "metrics": cust_metrics},
+            "orders": {"data": None, "metrics": {"ok": False, "status_code": None, "elapsed_ms": 0.0, "bytes": 0, "url": "", "error": "No customer id found for this email"}, "filter_ms": None},
+            "subscriptions": {"data": None, "metrics": {"ok": False, "status_code": None, "elapsed_ms": 0.0, "bytes": 0, "url": "", "error": "No customer id found for this email"}, "filter_ms": None},
             "subscription_ids": [],
             "subscription_orders": [],
         }
 
-    orders_url = wc_url(wc_base, "/wp-json/wc/v3/orders", f"customer={customer_id}&{extra_query}" if extra_query else f"customer={customer_id}")
-    orders_json, orders_metrics = timed_get_json(orders_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+    orders_q = f"customer={customer_id}"
+    if extra_query.strip():
+        orders_q = f"{orders_q}&{extra_query.strip()}"
+    orders_url = wc_make_url(wc_base, "/wp-json/wc/v3/orders", orders_q)
+    orders_json, orders_metrics = timed_get_json(orders_url, {"Accept": "application/json"}, timeout_s, verify_tls, auth=auth)
 
-    subs_url = wc_url(wc_base, "/wp-json/wc/v1/subscriptions", f"customer={customer_id}&{extra_query}" if extra_query else f"customer={customer_id}")
-    subs_json, subs_metrics = timed_get_json(subs_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+    subs_q = f"customer={customer_id}"
+    if extra_query.strip():
+        subs_q = f"{subs_q}&{extra_query.strip()}"
+    subs_url = wc_make_url(wc_base, "/wp-json/wc/v1/subscriptions", subs_q)
+    subs_json, subs_metrics = timed_get_json(subs_url, {"Accept": "application/json"}, timeout_s, verify_tls, auth=auth)
 
     if manual_sid.strip().isdigit():
         sub_ids = [int(manual_sid.strip())]
     else:
         sub_ids = collect_subscription_ids(subs_json)
 
-    sub_orders: List[Dict[str, Any]] = []
-    for sid in sub_ids:
-        so_url = wc_url(wc_base, f"/wp-json/wc/v1/subscriptions/{sid}/orders", extra_query)
-        so_json, so_metrics = timed_get_json(so_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
-        sub_orders.append({"subscription_id": sid, "data": so_json, "metrics": so_metrics})
-
-    return {
-        "customer_lookup": {"data": customers_payload, "metrics": customer_metrics, "customer_id": customer_id},
-        "orders": {"data": orders_json, "metrics": orders_metrics},
-        "subscriptions": {"data": subs_json, "metrics": subs_metrics},
-        "subscription_ids": sub_ids,
-        "subscription_orders": sub_orders,
-    }
-
-
-def run_wc_required(
-    wc_base: str,
-    ck: str,
-    cs: str,
-    email: str,
-    timeout_s: float,
-    verify_tls: bool,
-    extra_query: str,
-    manual_sid: str,
-) -> Dict[str, Any]:
-    auth = (ck, cs)
-
-    customer_id, customer_metrics, customers_payload = wc_get_customer_id_by_email(
-        wc_base, ck, cs, email, timeout_s, verify_tls
-    )
-
-    if not customer_id:
-        return {
-            "customer_lookup": {"data": customers_payload, "metrics": customer_metrics},
-            "orders": {"data": None, "metrics": {"ok": False, "status_code": None, "elapsed_ms": 0.0, "bytes": 0, "url": "", "error": "No customer id found for this email"}},
-            "subscriptions": {"data": None, "metrics": {"ok": False, "status_code": None, "elapsed_ms": 0.0, "bytes": 0, "url": "", "error": "No customer id found for this email"}},
-            "subscription_ids": [],
-            "subscription_orders": [],
-        }
-
-    subs_url = wc_url(wc_base, "/wp-json/wc/v1/subscriptions", f"customer={customer_id}&{extra_query}" if extra_query else f"customer={customer_id}")
-    subs_json, subs_metrics = timed_get_json(subs_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
-    t0 = time.perf_counter_ns()
-    subs_filtered = filter_subscriptions_payload(subs_json)
-    t1 = time.perf_counter_ns()
-    subs_filter_ms = (t1 - t0) / 1_000_000.0
-
-    orders_url = wc_url(wc_base, "/wp-json/wc/v3/orders", f"customer={customer_id}&{extra_query}" if extra_query else f"customer={customer_id}")
-    orders_json, orders_metrics = timed_get_json(orders_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
-    t0 = time.perf_counter_ns()
-    orders_filtered = filter_orders_payload(orders_json)
-    t1 = time.perf_counter_ns()
-    orders_filter_ms = (t1 - t0) / 1_000_000.0
-
-    if manual_sid.strip().isdigit():
-        sub_ids = [int(manual_sid.strip())]
-    else:
-        sub_ids = collect_subscription_ids(subs_json)
-
-    sub_orders: List[Dict[str, Any]] = []
-    for sid in sub_ids:
-        so_url = wc_url(wc_base, f"/wp-json/wc/v1/subscriptions/{sid}/orders", extra_query)
-        so_json, so_metrics = timed_get_json(so_url, headers={"Accept": "application/json"}, timeout_s=timeout_s, verify_tls=verify_tls, auth=auth)
+    if mode == "required":
         t0 = time.perf_counter_ns()
-        so_filtered = filter_orders_payload(so_json)
+        subs_out = filter_subscriptions_payload(subs_json)
         t1 = time.perf_counter_ns()
-        so_filter_ms = (t1 - t0) / 1_000_000.0
+        subs_filter_ms = (t1 - t0) / 1_000_000.0
+
+        t0 = time.perf_counter_ns()
+        orders_out = filter_orders_payload(orders_json)
+        t1 = time.perf_counter_ns()
+        orders_filter_ms = (t1 - t0) / 1_000_000.0
+    else:
+        subs_out = subs_json
+        orders_out = orders_json
+        subs_filter_ms = None
+        orders_filter_ms = None
+
+    sub_orders = []
+    for sid in sub_ids:
+        so_url = wc_make_url(wc_base, f"/wp-json/wc/v1/subscriptions/{sid}/orders", extra_query.strip())
+        so_json, so_metrics = timed_get_json(so_url, {"Accept": "application/json"}, timeout_s, verify_tls, auth=auth)
+
+        if mode == "required":
+            t0 = time.perf_counter_ns()
+            so_out = filter_orders_payload(so_json)
+            t1 = time.perf_counter_ns()
+            so_filter_ms = (t1 - t0) / 1_000_000.0
+        else:
+            so_out = so_json
+            so_filter_ms = None
+
         sub_orders.append(
             {
                 "subscription_id": sid,
-                "data": so_filtered,
+                "data": so_out,
                 "metrics": so_metrics,
-                "filter_elapsed_ms": so_filter_ms,
+                "filter_ms": so_filter_ms,
             }
         )
 
     return {
-        "customer_lookup": {"data": customers_payload, "metrics": customer_metrics, "customer_id": customer_id},
-        "subscriptions": {"data": subs_filtered, "metrics": subs_metrics, "filter_ms": subs_filter_ms},
-        "orders": {"data": orders_filtered, "metrics": orders_metrics, "filter_ms": orders_filter_ms},
+        "customer_lookup": {"data": cust_payload, "metrics": cust_metrics, "customer_id": customer_id},
+        "orders": {"data": orders_out, "metrics": orders_metrics, "filter_ms": orders_filter_ms},
+        "subscriptions": {"data": subs_out, "metrics": subs_metrics, "filter_ms": subs_filter_ms},
         "subscription_ids": sub_ids,
         "subscription_orders": sub_orders,
     }
@@ -596,13 +472,17 @@ def main():
         st.session_state.connected = False
     if "connect_report" not in st.session_state:
         st.session_state.connect_report = None
+    if "method" not in st.session_state:
+        st.session_state.method = "Proxy App Panel"
 
     with st.sidebar:
         st.header("Settings")
 
-        method = st.selectbox(
+        st.session_state.method = st.selectbox(
             "Fetch method",
             ["Proxy App Panel", "Direct WooCommerce"],
+            index=0 if st.session_state.method == "Proxy App Panel" else 1,
+            key="method_selectbox",
         )
 
         timeout_s = st.number_input(
@@ -616,32 +496,30 @@ def main():
         extra_query = st.text_input(
             "Extra query params",
             value="per_page=100",
-            help="Examples: per_page=100 or context=edit. This appends to direct endpoints and to proxy endpoints after email.",
         )
 
         manual_sid = st.text_input(
             "Optional subscription id override",
             value="",
-            help="If your subscriptions payload does not contain ids, paste one id here to force the third endpoint to run.",
         )
 
         st.divider()
         st.subheader("Connection")
 
         creds_ok = True
-        if method == "Proxy App Panel":
+        if st.session_state.method == "Proxy App Panel":
             st.write(f"Proxy base: {proxy_base}")
             if not proxy_api_key:
                 creds_ok = False
-                st.error("PROXY_API_KEY is missing in secrets or env")
+                st.error("PROXY_API_KEY missing")
         else:
             st.write(f"Woo base: {wc_base}")
             if not wc_ck or not wc_cs:
                 creds_ok = False
-                st.error("WC_CONSUMER_KEY or WC_CONSUMER_SECRET is missing in secrets or env")
+                st.error("WC_CONSUMER_KEY or WC_CONSUMER_SECRET missing")
 
         if st.button("Connect to API server", disabled=not creds_ok):
-            if method == "Proxy App Panel":
+            if st.session_state.method == "Proxy App Panel":
                 report = connection_check_proxy(proxy_base, proxy_api_key, timeout_s, verify_tls)
                 base_ok = bool(report["base"].get("ok"))
                 auth_ok = bool(report["auth_probe"].get("ok")) and report["auth_probe"].get("status_code") not in (401, 403)
@@ -664,7 +542,7 @@ def main():
                 st.json(st.session_state.connect_report)
 
     if not st.session_state.connected:
-        st.info("Use the sidebar Connect to API server button first. After Connected appears, run the tests.")
+        st.info("Connect first using the sidebar button. After Connected appears, run the tests.")
         return
 
     col1, col2 = st.columns(2)
@@ -672,108 +550,118 @@ def main():
     with col1:
         st.header("Full fetch mode")
         email_full = st.text_input("Customer email", key="email_full", placeholder="name@example.com")
-        if st.button("Run full fetch", key="run_full"):
+        run_full = st.button("Run full fetch", key="run_full")
+
+        if run_full:
             if not email_full.strip():
                 st.error("Enter email first.")
             else:
-                if method == "Proxy App Panel":
-                    results = run_proxy_full(proxy_base, proxy_api_key, email_full, timeout_s, verify_tls, extra_query, manual_sid)
-                    render_call_block("Orders full", results["orders"]["data"], results["orders"]["metrics"])
-                    render_call_block("Subscriptions full", results["subscriptions"]["data"], results["subscriptions"]["metrics"])
+                if st.session_state.method == "Proxy App Panel":
+                    results = run_proxy(email_full, proxy_base, proxy_api_key, timeout_s, verify_tls, extra_query, manual_sid, mode="full")
                     st.write(f"Subscription ids found: {results['subscription_ids']}")
+                    render_call_block("Orders full", results["orders"]["data"], results["orders"]["metrics"], json_key="full_orders")
+                    render_call_block("Subscriptions full", results["subscriptions"]["data"], results["subscriptions"]["metrics"], json_key="full_subs")
                     st.subheader("Subscription id orders full")
                     if not results["subscription_orders"]:
                         st.info("No subscription ids found or returned, third endpoint skipped.")
-                    for entry in results["subscription_orders"]:
+                    for i, entry in enumerate(results["subscription_orders"], start=1):
                         render_call_block(
                             f"Subscription {entry['subscription_id']} orders full",
                             entry["data"],
                             entry["metrics"],
+                            json_key=f"full_sub_orders_{i}",
                         )
                 else:
-                    results = run_wc_full(wc_base, wc_ck, wc_cs, email_full, timeout_s, verify_tls, extra_query, manual_sid)
-                    render_call_block("Customer lookup", results["customer_lookup"]["data"], results["customer_lookup"]["metrics"])
+                    results = run_wc(email_full, wc_base, wc_ck, wc_cs, timeout_s, verify_tls, extra_query, manual_sid, mode="full")
+                    render_call_block("Customer lookup", results["customer_lookup"]["data"], results["customer_lookup"]["metrics"], json_key="full_customer")
                     if "customer_id" in results["customer_lookup"]:
                         st.write(f"Resolved Woo customer id: {results['customer_lookup']['customer_id']}")
-                    render_call_block("Orders full", results["orders"]["data"], results["orders"]["metrics"])
-                    render_call_block("Subscriptions full", results["subscriptions"]["data"], results["subscriptions"]["metrics"])
                     st.write(f"Subscription ids found: {results['subscription_ids']}")
+                    render_call_block("Orders full", results["orders"]["data"], results["orders"]["metrics"], json_key="full_orders")
+                    render_call_block("Subscriptions full", results["subscriptions"]["data"], results["subscriptions"]["metrics"], json_key="full_subs")
                     st.subheader("Subscription id orders full")
                     if not results["subscription_orders"]:
                         st.info("No subscription ids found or returned, third endpoint skipped.")
-                    for entry in results["subscription_orders"]:
+                    for i, entry in enumerate(results["subscription_orders"], start=1):
                         render_call_block(
                             f"Subscription {entry['subscription_id']} orders full",
                             entry["data"],
                             entry["metrics"],
+                            json_key=f"full_sub_orders_{i}",
                         )
 
     with col2:
         st.header("Required fields mode")
         email_req = st.text_input("Customer email", key="email_req", placeholder="name@example.com")
-        if st.button("Run required fields", key="run_req"):
+        run_req = st.button("Run required fields", key="run_req")
+
+        if run_req:
             if not email_req.strip():
                 st.error("Enter email first.")
             else:
-                if method == "Proxy App Panel":
-                    results = run_proxy_required(proxy_base, proxy_api_key, email_req, timeout_s, verify_tls, extra_query, manual_sid)
-
-                    render_call_block(
-                        "Subscriptions required",
-                        results["subscriptions"]["data"],
-                        results["subscriptions"]["metrics"],
-                        extra_time_ms=results["subscriptions"]["filter_ms"],
-                    )
+                if st.session_state.method == "Proxy App Panel":
+                    results = run_proxy(email_req, proxy_base, proxy_api_key, timeout_s, verify_tls, extra_query, manual_sid, mode="required")
+                    st.write(f"Subscription ids found: {results['subscription_ids']}")
 
                     render_call_block(
                         "Orders required",
                         results["orders"]["data"],
                         results["orders"]["metrics"],
                         extra_time_ms=results["orders"]["filter_ms"],
+                        json_key="req_orders",
+                    )
+                    render_call_block(
+                        "Subscriptions required",
+                        results["subscriptions"]["data"],
+                        results["subscriptions"]["metrics"],
+                        extra_time_ms=results["subscriptions"]["filter_ms"],
+                        json_key="req_subs",
                     )
 
-                    st.write(f"Subscription ids found: {results['subscription_ids']}")
                     st.subheader("Subscription id orders required")
                     if not results["subscription_orders"]:
                         st.info("No subscription ids found or returned, third endpoint skipped.")
-                    for entry in results["subscription_orders"]:
+                    for i, entry in enumerate(results["subscription_orders"], start=1):
                         render_call_block(
                             f"Subscription {entry['subscription_id']} orders required",
                             entry["data"],
                             entry["metrics"],
-                            extra_time_ms=entry["filter_elapsed_ms"],
+                            extra_time_ms=entry["filter_ms"],
+                            json_key=f"req_sub_orders_{i}",
                         )
                 else:
-                    results = run_wc_required(wc_base, wc_ck, wc_cs, email_req, timeout_s, verify_tls, extra_query, manual_sid)
-
-                    render_call_block("Customer lookup", results["customer_lookup"]["data"], results["customer_lookup"]["metrics"])
+                    results = run_wc(email_req, wc_base, wc_ck, wc_cs, timeout_s, verify_tls, extra_query, manual_sid, mode="required")
+                    render_call_block("Customer lookup", results["customer_lookup"]["data"], results["customer_lookup"]["metrics"], json_key="req_customer")
                     if "customer_id" in results["customer_lookup"]:
                         st.write(f"Resolved Woo customer id: {results['customer_lookup']['customer_id']}")
 
-                    render_call_block(
-                        "Subscriptions required",
-                        results["subscriptions"]["data"],
-                        results["subscriptions"]["metrics"],
-                        extra_time_ms=results["subscriptions"]["filter_ms"],
-                    )
+                    st.write(f"Subscription ids found: {results['subscription_ids']}")
 
                     render_call_block(
                         "Orders required",
                         results["orders"]["data"],
                         results["orders"]["metrics"],
                         extra_time_ms=results["orders"]["filter_ms"],
+                        json_key="req_orders",
+                    )
+                    render_call_block(
+                        "Subscriptions required",
+                        results["subscriptions"]["data"],
+                        results["subscriptions"]["metrics"],
+                        extra_time_ms=results["subscriptions"]["filter_ms"],
+                        json_key="req_subs",
                     )
 
-                    st.write(f"Subscription ids found: {results['subscription_ids']}")
                     st.subheader("Subscription id orders required")
                     if not results["subscription_orders"]:
                         st.info("No subscription ids found or returned, third endpoint skipped.")
-                    for entry in results["subscription_orders"]:
+                    for i, entry in enumerate(results["subscription_orders"], start=1):
                         render_call_block(
                             f"Subscription {entry['subscription_id']} orders required",
                             entry["data"],
                             entry["metrics"],
-                            extra_time_ms=entry["filter_elapsed_ms"],
+                            extra_time_ms=entry["filter_ms"],
+                            json_key=f"req_sub_orders_{i}",
                         )
 
 
